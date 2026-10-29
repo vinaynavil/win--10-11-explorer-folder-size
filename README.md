@@ -107,8 +107,8 @@ Right-click the tray icon to access:
 
 ```powershell
 # 1. Clone the repository
-git clone https://github.com/vinaynavil/win11-explorer-folder-size.git
-cd win11-explorer-folder-size
+git clone https://github.com/vinaynavil/win--10-11-explorer-folder-size.git
+cd win--10-11-explorer-folder-size
 
 # 2. Configure with CMake
 cmake -B build -G "Visual Studio 17 2022" -A x64
