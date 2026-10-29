@@ -1,0 +1,10 @@
+^C:\USERS\VINAY NAVIL\VIDEOS\WIN11-EXPLORER-FOLDER-SIZE\BUILD\CMAKEFILES\82A013C67711A14F1C52366057AC8FE7\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" "-SC:/Users/Vinay Navil/Videos/win11-explorer-folder-size" "-BC:/Users/Vinay Navil/Videos/win11-explorer-folder-size/build" --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file "C:/Users/Vinay Navil/Videos/win11-explorer-folder-size/build/ExplorerFolderSize.sln"
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

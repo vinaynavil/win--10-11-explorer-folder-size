@@ -1,0 +1,3 @@
+C:/Users/Vinay Navil/Videos/win11-explorer-folder-size/build/CMakeFiles/ExplorerFolderSize.dir
+C:/Users/Vinay Navil/Videos/win11-explorer-folder-size/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/Vinay Navil/Videos/win11-explorer-folder-size/build/CMakeFiles/ZERO_CHECK.dir
