@@ -36,8 +36,8 @@
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│             Windows 11 / 10 File Explorer               │
-│   (CabinetWClass -> ShellTabWindowClass -> DirectUIHWND) │
+│             Windows 11 / 10 File Explorer              │
+│ (CabinetWClass -> ShellTabWindowClass -> DirectUIHWND) │
 └───────────────────────────┬────────────────────────────┘
                             │
                UIA Bounds & Window Tracking
