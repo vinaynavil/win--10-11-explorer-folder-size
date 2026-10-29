@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="backTab" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#F59E0B"/>
+      <stop offset="100%" stop-color="#B45309"/>
+    </linearGradient>
+    <linearGradient id="frontFlap" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FCD34D"/>
+      <stop offset="15%" stop-color="#FBBF24"/>
+      <stop offset="100%" stop-color="#D97706"/>
+    </linearGradient>
+    <linearGradient id="cyanRuler" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#22D3EE"/>
+      <stop offset="100%" stop-color="#0284C7"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Back Folder Tab & Body -->
+  <path d="M 20 56 C 20 42 32 30 46 30 L 98 30 C 107 30 114 35 119 43 L 128 56 L 210 56 C 224 56 236 68 236 82 L 236 196 C 236 210 224 222 210 222 L 46 222 C 32 222 20 210 20 196 Z" fill="url(#backTab)"/>
+
+  <!-- Subtle Inner Shadow Strip -->
+  <path d="M 30 92 C 30 80 40 72 52 72 L 116 72 L 130 58 L 214 58 C 226 58 236 68 236 80 L 236 105 L 30 105 Z" fill="#92400E" opacity="0.45"/>
+
+  <!-- Front 2D Folder Flap -->
+  <path d="M 20 104 C 20 90 31 80 45 80 L 112 80 C 120 80 127 75 132 68 C 136 62 143 58 151 58 L 214 58 C 228 58 238 69 236 83 L 226 198 C 224 212 213 222 199 222 L 44 222 C 30 222 20 211 20 197 Z" fill="url(#frontFlap)"/>
+
+  <!-- Top Bevel Highlight on Front Flap -->
+  <path d="M 24 100 C 26 88 35 80 46 80 L 112 80 C 120 80 127 75 132 68 C 136 62 143 58 151 58 L 214 58 C 225 58 234 65 236 75 C 232 67 224 64 213 64 L 151 64 C 143 64 136 68 132 74 C 127 81 120 86 112 86 L 46 86 C 35 86 27 92 24 100 Z" fill="#FEF08A" opacity="0.75"/>
+
+  <!-- Bottom-Left Data Bars (2D Minimalist Capacity Bars) -->
+  <g fill="#B45309">
+    <rect x="42" y="182" width="8" height="24" rx="3"/>
+    <rect x="56" y="192" width="8" height="14" rx="3"/>
+    <rect x="70" y="185" width="8" height="21" rx="3"/>
+    <rect x="84" y="174" width="8" height="32" rx="3"/>
+    <rect x="98" y="192" width="8" height="14" rx="3"/>
+  </g>
+
+  <!-- Vertical Cyan Measuring Band -->
+  <rect x="144" y="58" width="44" height="164" fill="#0369A1"/>
+  <rect x="148" y="58" width="36" height="164" fill="url(#cyanRuler)"/>
+
+  <!-- High-Contrast Metric Ruler Ticks -->
+  <g fill="#083344">
+    <rect x="148" y="76"  width="20" height="6" rx="2"/>
+    <rect x="148" y="94"  width="12" height="5" rx="2"/>
+    <rect x="148" y="112" width="24" height="6" rx="2"/>
+    <rect x="148" y="130" width="12" height="5" rx="2"/>
+    <rect x="148" y="148" width="20" height="6" rx="2"/>
+    <rect x="148" y="166" width="12" height="5" rx="2"/>
+    <rect x="148" y="184" width="24" height="6" rx="2"/>
+    <rect x="148" y="202" width="14" height="5" rx="2"/>
+  </g>
+
+  <!-- Rightward Size Indicator Arrow -->
+  <path d="M 188 140 L 216 140 M 204 126 L 218 140 L 204 154" stroke="#083344" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>
+

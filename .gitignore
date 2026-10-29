@@ -1,0 +1,18 @@
+# Build output & binaries
+build/
+bin/
+out/
+x64/
+Debug/
+Release/
+
+# Visual Studio & CMake intermediate files
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# System files
+.DS_Store
+Thumbs.db

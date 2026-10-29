@@ -4,8 +4,8 @@
 
 SizeCalculator::SizeCalculator(UpdateCallback onUpdateCallback)
     : m_onUpdate(std::move(onUpdateCallback)) {
-    unsigned int hwThreads = std::thread::hardware_concurrency();
-    size_t workerCount = std::clamp(static_cast<size_t>(hwThreads / 2), size_t(2), size_t(4));
+    // 2 background threads saturate NVMe directory metadata scans while minimizing thread stack RAM
+    constexpr size_t workerCount = 2;
     m_workers.reserve(workerCount);
     for (size_t i = 0; i < workerCount; ++i) {
         m_workers.emplace_back(&SizeCalculator::WorkerLoop, this);
@@ -38,7 +38,6 @@ std::wstring SizeCalculator::ToLongPath(const std::wstring& path) {
         return path;
     }
     if (path.rfind(L"\\\\", 0) == 0) {
-        // UNC path \\server\share -> \\?\UNC\server\share
         return L"\\\\?\\UNC\\" + path.substr(2);
     }
     return L"\\\\?\\" + path;
@@ -49,7 +48,6 @@ FolderSizeResult SizeCalculator::RequestFolderSize(const std::wstring& folderPat
     const uint64_t currentWriteTime = GetFolderWriteTime(folderPath);
 
     std::lock_guard<std::mutex> lock(m_mutex);
-
     auto it = m_cache.find(folderPath);
     if (it != m_cache.end()) {
         CacheEntry& entry = it->second;
@@ -59,11 +57,12 @@ FolderSizeResult SizeCalculator::RequestFolderSize(const std::wstring& folderPat
             if (writeTimeUnchanged && withinTtl) {
                 return FolderSizeResult{ entry.sizeBytes, entry.status, entry.formattedText };
             }
-            // Queue a background refresh while still returning the last known size so UI doesn't flicker
             entry.status = CalculationStatus::Calculating;
             entry.folderWriteTime = currentWriteTime;
-            m_queue.push_front(folderPath);
-            m_cv.notify_one();
+            if (std::find(m_queue.begin(), m_queue.end(), folderPath) == m_queue.end()) {
+                m_queue.push_front(folderPath);
+                m_cv.notify_one();
+            }
             return FolderSizeResult{ entry.sizeBytes, CalculationStatus::Ready, entry.formattedText };
         }
         return FolderSizeResult{ entry.sizeBytes, entry.status, entry.formattedText };
@@ -81,9 +80,10 @@ FolderSizeResult SizeCalculator::RequestFolderSize(const std::wstring& folderPat
     newEntry.calculatedTick = now;
     m_cache.emplace(folderPath, newEntry);
 
-    // Push to front (LIFO order) so currently visible viewport folders calculate first
-    m_queue.push_front(folderPath);
-    m_cv.notify_one();
+    if (std::find(m_queue.begin(), m_queue.end(), folderPath) == m_queue.end()) {
+        m_queue.push_front(folderPath);
+        m_cv.notify_one();
+    }
 
     return FolderSizeResult{ 0, CalculationStatus::Calculating, L"..." };
 }
@@ -92,6 +92,7 @@ void SizeCalculator::ClearCache() {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_cache.clear();
     m_queue.clear();
+    m_queue.shrink_to_fit();
 }
 
 void SizeCalculator::WorkerLoop() {
@@ -104,11 +105,9 @@ void SizeCalculator::WorkerLoop() {
             m_cv.wait(lock, [this]() {
                 return m_stop.load(std::memory_order_acquire) || !m_queue.empty();
             });
-
             if (m_stop.load(std::memory_order_acquire)) {
                 return;
             }
-
             targetPath = std::move(m_queue.front());
             m_queue.pop_front();
         }
@@ -150,8 +149,8 @@ uint64_t SizeCalculator::ComputeDirectorySize(const std::wstring& rootPath) cons
         if (!currentDir.empty() && currentDir.back() != L'\\') {
             currentDir.push_back(L'\\');
         }
-        std::wstring searchPattern = currentDir + L"*";
 
+        std::wstring searchPattern = currentDir + L"*";
         HANDLE hFind = FindFirstFileExW(
             searchPattern.c_str(),
             FindExInfoBasic,
@@ -166,14 +165,11 @@ uint64_t SizeCalculator::ComputeDirectorySize(const std::wstring& rootPath) cons
 
         do {
             const wchar_t* name = findData.cFileName;
-            // Skip "." and ".."
             if (name[0] == L'.' && (name[1] == L'\0' || (name[1] == L'.' && name[2] == L'\0'))) {
                 continue;
             }
 
             const DWORD attrs = findData.dwFileAttributes;
-
-            // Skip junctions, symlinks, and mount points to prevent infinite loops or double counting
             if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
                 continue;
             }

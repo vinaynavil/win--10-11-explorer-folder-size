@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ExplorerFolderSize VERSION 1.0.0 LANGUAGES CXX)
+project(ExplorerFolderSize VERSION 1.0.0 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,6 +15,8 @@ add_executable(ExplorerFolderSize WIN32
     src/SizeCalculator.cpp
     src/OverlayRenderer.h
     src/OverlayRenderer.cpp
+    src/resource.h
+    src/app.rc
 )
 
 if(MSVC)
