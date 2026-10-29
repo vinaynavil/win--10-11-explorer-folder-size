@@ -114,6 +114,19 @@ namespace {
             }
             return 0;
 
+        case WM_TIMER:
+            if (wParam == ExplorerTracker::kRefreshTimerId) {
+                KillTimer(hwnd, ExplorerTracker::kRefreshTimerId);
+                if (g_tracker) {
+                    g_tracker->OnTimerTick();
+                }
+            } else if (wParam == ExplorerTracker::kPeriodicTimerId) {
+                if (g_tracker) {
+                    g_tracker->OnTimerTick();
+                }
+            }
+            return 0;
+
         case WM_ASYNC_SIZE_UPDATED:
             if (g_tracker) {
                 g_tracker->RequestRefresh();

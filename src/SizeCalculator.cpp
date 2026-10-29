@@ -1,18 +1,197 @@
 #include "SizeCalculator.h"
 #include <cwchar>
+#include <algorithm>
 
 SizeCalculator::SizeCalculator(UpdateCallback onUpdateCallback)
-    : m_onUpdate(std::move(onUpdateCallback)) {}
+    : m_onUpdate(std::move(onUpdateCallback)) {
+    unsigned int hwThreads = std::thread::hardware_concurrency();
+    size_t workerCount = std::clamp(static_cast<size_t>(hwThreads / 2), size_t(2), size_t(4));
+    m_workers.reserve(workerCount);
+    for (size_t i = 0; i < workerCount; ++i) {
+        m_workers.emplace_back(&SizeCalculator::WorkerLoop, this);
+    }
+}
 
-SizeCalculator::~SizeCalculator() = default;
+SizeCalculator::~SizeCalculator() {
+    m_stop.store(true, std::memory_order_release);
+    m_cv.notify_all();
+    for (auto& t : m_workers) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+}
 
-FolderSizeResult SizeCalculator::RequestFolderSize(const std::wstring& /*folderPath*/) {
-    // Phase 3 will implement the multi-threaded FindFirstFileExW worker pool & LRU cache
+uint64_t SizeCalculator::GetFolderWriteTime(const std::wstring& folderPath) {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (GetFileAttributesExW(folderPath.c_str(), GetFileExInfoStandard, &fad)) {
+        ULARGE_INTEGER uli{};
+        uli.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+        uli.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+        return uli.QuadPart;
+    }
+    return 0;
+}
+
+std::wstring SizeCalculator::ToLongPath(const std::wstring& path) {
+    if (path.rfind(L"\\\\?\\", 0) == 0) {
+        return path;
+    }
+    if (path.rfind(L"\\\\", 0) == 0) {
+        // UNC path \\server\share -> \\?\UNC\server\share
+        return L"\\\\?\\UNC\\" + path.substr(2);
+    }
+    return L"\\\\?\\" + path;
+}
+
+FolderSizeResult SizeCalculator::RequestFolderSize(const std::wstring& folderPath) {
+    const ULONGLONG now = GetTickCount64();
+    const uint64_t currentWriteTime = GetFolderWriteTime(folderPath);
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    auto it = m_cache.find(folderPath);
+    if (it != m_cache.end()) {
+        CacheEntry& entry = it->second;
+        if (entry.status == CalculationStatus::Ready) {
+            bool writeTimeUnchanged = (currentWriteTime != 0 && entry.folderWriteTime == currentWriteTime);
+            bool withinTtl = (now - entry.calculatedTick) < kCacheTtlMs;
+            if (writeTimeUnchanged && withinTtl) {
+                return FolderSizeResult{ entry.sizeBytes, entry.status, entry.formattedText };
+            }
+            // Queue a background refresh while still returning the last known size so UI doesn't flicker
+            entry.status = CalculationStatus::Calculating;
+            entry.folderWriteTime = currentWriteTime;
+            m_queue.push_front(folderPath);
+            m_cv.notify_one();
+            return FolderSizeResult{ entry.sizeBytes, CalculationStatus::Ready, entry.formattedText };
+        }
+        return FolderSizeResult{ entry.sizeBytes, entry.status, entry.formattedText };
+    }
+
+    if (m_cache.size() >= kMaxCacheEntries) {
+        m_cache.clear();
+    }
+
+    CacheEntry newEntry{};
+    newEntry.sizeBytes = 0;
+    newEntry.status = CalculationStatus::Calculating;
+    newEntry.formattedText = L"...";
+    newEntry.folderWriteTime = currentWriteTime;
+    newEntry.calculatedTick = now;
+    m_cache.emplace(folderPath, newEntry);
+
+    // Push to front (LIFO order) so currently visible viewport folders calculate first
+    m_queue.push_front(folderPath);
+    m_cv.notify_one();
+
     return FolderSizeResult{ 0, CalculationStatus::Calculating, L"..." };
 }
 
 void SizeCalculator::ClearCache() {
-    // Phase 3 will clear the thread-safe LRU cache
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_cache.clear();
+    m_queue.clear();
+}
+
+void SizeCalculator::WorkerLoop() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
+    while (!m_stop.load(std::memory_order_acquire)) {
+        std::wstring targetPath;
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_cv.wait(lock, [this]() {
+                return m_stop.load(std::memory_order_acquire) || !m_queue.empty();
+            });
+
+            if (m_stop.load(std::memory_order_acquire)) {
+                return;
+            }
+
+            targetPath = std::move(m_queue.front());
+            m_queue.pop_front();
+        }
+
+        uint64_t totalBytes = ComputeDirectorySize(targetPath);
+        std::wstring formatted = FormatSize(totalBytes);
+        uint64_t writeTime = GetFolderWriteTime(targetPath);
+
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto it = m_cache.find(targetPath);
+            if (it != m_cache.end()) {
+                it->second.sizeBytes = totalBytes;
+                it->second.status = CalculationStatus::Ready;
+                it->second.formattedText = std::move(formatted);
+                it->second.folderWriteTime = writeTime;
+                it->second.calculatedTick = GetTickCount64();
+            }
+        }
+
+        if (m_onUpdate && !m_stop.load(std::memory_order_acquire)) {
+            m_onUpdate();
+        }
+    }
+}
+
+uint64_t SizeCalculator::ComputeDirectorySize(const std::wstring& rootPath) const {
+    uint64_t totalSize = 0;
+    std::vector<std::wstring> dirStack;
+    dirStack.reserve(64);
+    dirStack.push_back(ToLongPath(rootPath));
+
+    WIN32_FIND_DATAW findData{};
+
+    while (!dirStack.empty() && !m_stop.load(std::memory_order_relaxed)) {
+        std::wstring currentDir = std::move(dirStack.back());
+        dirStack.pop_back();
+
+        if (!currentDir.empty() && currentDir.back() != L'\\') {
+            currentDir.push_back(L'\\');
+        }
+        std::wstring searchPattern = currentDir + L"*";
+
+        HANDLE hFind = FindFirstFileExW(
+            searchPattern.c_str(),
+            FindExInfoBasic,
+            &findData,
+            FindExSearchNameMatch,
+            nullptr,
+            FIND_FIRST_EX_LARGE_FETCH);
+
+        if (hFind == INVALID_HANDLE_VALUE) {
+            continue;
+        }
+
+        do {
+            const wchar_t* name = findData.cFileName;
+            // Skip "." and ".."
+            if (name[0] == L'.' && (name[1] == L'\0' || (name[1] == L'.' && name[2] == L'\0'))) {
+                continue;
+            }
+
+            const DWORD attrs = findData.dwFileAttributes;
+
+            // Skip junctions, symlinks, and mount points to prevent infinite loops or double counting
+            if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                continue;
+            }
+
+            if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                dirStack.push_back(currentDir + name);
+            } else {
+                ULARGE_INTEGER fileSize{};
+                fileSize.LowPart = findData.nFileSizeLow;
+                fileSize.HighPart = findData.nFileSizeHigh;
+                totalSize += fileSize.QuadPart;
+            }
+        } while (FindNextFileW(hFind, &findData) != 0);
+
+        FindClose(hFind);
+    }
+
+    return totalSize;
 }
 
 std::wstring SizeCalculator::FormatSize(uint64_t bytes) {
