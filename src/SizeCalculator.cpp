@@ -12,6 +12,15 @@ SizeCalculator::SizeCalculator(UpdateCallback onUpdateCallback)
     }
 }
 
+SizeCalculator::SizeCalculator(PathUpdateCallback onPathUpdateCallback)
+    : m_onPathUpdate(std::move(onPathUpdateCallback)) {
+    constexpr size_t workerCount = 2;
+    m_workers.reserve(workerCount);
+    for (size_t i = 0; i < workerCount; ++i) {
+        m_workers.emplace_back(&SizeCalculator::WorkerLoop, this);
+    }
+}
+
 SizeCalculator::~SizeCalculator() {
     m_stop.store(true, std::memory_order_release);
     m_cv.notify_all();
@@ -128,8 +137,13 @@ void SizeCalculator::WorkerLoop() {
             }
         }
 
-        if (m_onUpdate && !m_stop.load(std::memory_order_acquire)) {
-            m_onUpdate();
+        if (!m_stop.load(std::memory_order_acquire)) {
+            if (m_onPathUpdate) {
+                m_onPathUpdate(targetPath);
+            }
+            if (m_onUpdate) {
+                m_onUpdate();
+            }
         }
     }
 }

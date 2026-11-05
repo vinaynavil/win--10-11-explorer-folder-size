@@ -1,16 +1,15 @@
 #include <windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <objbase.h>
 #include <string>
+#include <unordered_map>
 
 #include "resource.h"
-#include "SizeCalculator.h"
-#include "OverlayRenderer.h"
-#include "ExplorerTracker.h"
+#include "ShellHook.h"
 
 namespace {
 constexpr UINT WM_TRAYICON = WM_APP + 1;
-constexpr UINT WM_ASYNC_SIZE_UPDATED = WM_APP + 2;
 
 constexpr UINT ID_TRAY_PAUSE = 1001;
 constexpr UINT ID_TRAY_CLEAR_CACHE = 1002;
@@ -18,6 +17,7 @@ constexpr UINT ID_TRAY_AUTOSTART = 1003;
 constexpr UINT ID_TRAY_EXIT = 1004;
 
 constexpr UINT_PTR kIdleTrimTimerId = 3001;
+constexpr UINT_PTR kSyncTimerId = 3002;
 
 constexpr wchar_t kMutexName[] = L"Local\\Win11ExplorerFolderSize_SingleInstance_Mutex";
 constexpr wchar_t kWndClassName[] = L"Win11ExplorerFolderSizeMsgWnd";
@@ -26,23 +26,20 @@ constexpr wchar_t kRunAppName[] = L"ExplorerFolderSize";
 
 NOTIFYICONDATAW g_nid{};
 UINT g_msgTaskbarCreated = 0;
-bool g_wasExplorerActive = true;
 
-SizeCalculator* g_calculator = nullptr;
-OverlayRenderer* g_renderer = nullptr;
-ExplorerTracker* g_tracker = nullptr;
+HANDLE g_hSharedMap = nullptr;
+SharedHookControl* g_sharedCtrl = nullptr;
+
+HMODULE g_hHookDll = nullptr;
+HOOKPROC g_hookProc = nullptr;
+using PFN_NotifyExplorerRefresh = void (CALLBACK*)();
+PFN_NotifyExplorerRefresh g_notifyRefresh = nullptr;
+
+std::unordered_map<DWORD, HHOOK> g_threadHooks;
+HWINEVENTHOOK g_hWinEventHook = nullptr;
 
 void TrimProcessMemory() {
     SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
-}
-
-bool IsExplorerForeground() {
-    HWND fg = GetForegroundWindow();
-    if (!fg || IsIconic(fg)) {
-        return false;
-    }
-    wchar_t cls[64]{};
-    return (GetClassNameW(fg, cls, 64) > 0 && wcscmp(cls, L"CabinetWClass") == 0);
 }
 
 void AddOrRestoreTrayIcon() {
@@ -104,6 +101,177 @@ void SyncAutoStartPathIfEnabled() {
     RegCloseKey(hKey);
 }
 
+void InitSharedControl() {
+    g_hSharedMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(SharedHookControl), kSharedHookControlName);
+    if (!g_hSharedMap) {
+        g_hSharedMap = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, kSharedHookControlName);
+    }
+    if (g_hSharedMap) {
+        g_sharedCtrl = static_cast<SharedHookControl*>(MapViewOfFile(g_hSharedMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(SharedHookControl)));
+        if (g_sharedCtrl) {
+            InterlockedExchange(&g_sharedCtrl->paused, 0);
+            InterlockedExchange(&g_sharedCtrl->clearCacheSeq, 0);
+            InterlockedExchange(&g_sharedCtrl->unloadRequested, 0);
+        }
+    }
+}
+
+bool LoadHookDll() {
+    wchar_t exePath[MAX_PATH]{};
+    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) == 0) return false;
+    wchar_t* lastSlash = wcsrchr(exePath, L'\\');
+    if (lastSlash) {
+        *(lastSlash + 1) = L'\0';
+    }
+    std::wstring dllPath = std::wstring(exePath) + L"ExplorerFolderSizeHook.dll";
+    g_hHookDll = LoadLibraryW(dllPath.c_str());
+    if (g_hHookDll) {
+        g_hookProc = reinterpret_cast<HOOKPROC>(GetProcAddress(g_hHookDll, "ExplorerCallWndProc"));
+        g_notifyRefresh = reinterpret_cast<PFN_NotifyExplorerRefresh>(GetProcAddress(g_hHookDll, "NotifyExplorerRefresh"));
+        return (g_hookProc != nullptr);
+    }
+    return false;
+}
+
+void RefreshAllExplorerWindows() {
+    if (g_notifyRefresh) {
+        g_notifyRefresh();
+    } else {
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_FLUSHNOWAIT, nullptr, nullptr);
+    }
+
+    EnumWindows([](HWND hwnd, LPARAM) -> BOOL {
+        if (!IsWindowVisible(hwnd)) return TRUE;
+        wchar_t cls[64]{};
+        if (GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) > 0 && wcscmp(cls, L"CabinetWClass") == 0) {
+            PostMessageW(hwnd, WM_COMMAND, 41504, 0);
+            InvalidateRect(hwnd, nullptr, TRUE);
+        }
+        return TRUE;
+    }, 0);
+}
+
+void SyncExplorerHooks() {
+    if (!g_hookProc || !g_hHookDll) return;
+
+    // 1. Prune dead thread IDs
+    for (auto it = g_threadHooks.begin(); it != g_threadHooks.end(); ) {
+        HANDLE hThread = OpenThread(SYNCHRONIZE, FALSE, it->first);
+        if (!hThread) {
+            UnhookWindowsHookEx(it->second);
+            it = g_threadHooks.erase(it);
+        } else {
+            DWORD waitRes = WaitForSingleObject(hThread, 0);
+            CloseHandle(hThread);
+            if (waitRes == WAIT_OBJECT_0) {
+                UnhookWindowsHookEx(it->second);
+                it = g_threadHooks.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // 2. Discover and hook active Explorer threads
+    auto HookThreadIfNew = [](HWND hwnd) {
+        if (!hwnd || !IsWindow(hwnd)) return;
+        DWORD pid = 0;
+        DWORD threadId = GetWindowThreadProcessId(hwnd, &pid);
+        if (threadId != 0 && pid != 0 && pid != GetCurrentProcessId()) {
+            if (g_threadHooks.find(threadId) == g_threadHooks.end()) {
+                HHOOK hHook = SetWindowsHookExW(WH_CALLWNDPROC, g_hookProc, g_hHookDll, threadId);
+                if (hHook) {
+                    g_threadHooks[threadId] = hHook;
+                    SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, nullptr);
+                }
+            }
+        }
+    };
+
+    HWND shellHwnd = GetShellWindow();
+    if (shellHwnd) {
+        HookThreadIfNew(shellHwnd);
+    }
+
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        auto* pHookFunc = reinterpret_cast<decltype(HookThreadIfNew)*>(lParam);
+        wchar_t cls[64]{};
+        if (GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) > 0 && wcscmp(cls, L"CabinetWClass") == 0) {
+            (*pHookFunc)(hwnd);
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&HookThreadIfNew));
+}
+
+void ShutdownHooks() {
+    if (g_hWinEventHook) {
+        UnhookWinEvent(g_hWinEventHook);
+        g_hWinEventHook = nullptr;
+    }
+
+    if (g_sharedCtrl) {
+        InterlockedExchange(&g_sharedCtrl->unloadRequested, 1);
+        InterlockedExchange(&g_sharedCtrl->paused, 1);
+    }
+
+    for (auto& pair : g_threadHooks) {
+        if (pair.second) {
+            UnhookWindowsHookEx(pair.second);
+        }
+    }
+    g_threadHooks.clear();
+
+    EnumWindows([](HWND hwnd, LPARAM) -> BOOL {
+        wchar_t cls[64]{};
+        if (GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) > 0 && wcscmp(cls, L"CabinetWClass") == 0) {
+            SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, nullptr);
+        }
+        return TRUE;
+    }, 0);
+
+    HWND shellHwnd = GetShellWindow();
+    if (shellHwnd) {
+        SendMessageTimeoutW(shellHwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, nullptr);
+    }
+
+    if (g_hHookDll) {
+        FreeLibrary(g_hHookDll);
+        g_hHookDll = nullptr;
+    }
+    if (g_sharedCtrl) {
+        UnmapViewOfFile(g_sharedCtrl);
+        g_sharedCtrl = nullptr;
+    }
+    if (g_hSharedMap) {
+        CloseHandle(g_hSharedMap);
+        g_hSharedMap = nullptr;
+    }
+}
+
+void CALLBACK WinEventProc(
+    HWINEVENTHOOK hWinEventHook,
+    DWORD event,
+    HWND hwnd,
+    LONG idObject,
+    LONG idChild,
+    DWORD idEventThread,
+    DWORD dwmsEventTime)
+{
+    UNREFERENCED_PARAMETER(hWinEventHook);
+    UNREFERENCED_PARAMETER(event);
+    UNREFERENCED_PARAMETER(idObject);
+    UNREFERENCED_PARAMETER(idChild);
+    UNREFERENCED_PARAMETER(idEventThread);
+    UNREFERENCED_PARAMETER(dwmsEventTime);
+
+    if (hwnd) {
+        wchar_t cls[64]{};
+        if (GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) > 0 && wcscmp(cls, L"CabinetWClass") == 0) {
+            SyncExplorerHooks();
+        }
+    }
+}
+
 void ShowTrayContextMenu(HWND hwnd) {
     POINT pt{};
     GetCursorPos(&pt);
@@ -111,7 +279,7 @@ void ShowTrayContextMenu(HWND hwnd) {
     HMENU hMenu = CreatePopupMenu();
     if (!hMenu) return;
 
-    bool isPaused = g_tracker && g_tracker->IsPaused();
+    bool isPaused = g_sharedCtrl && (InterlockedCompareExchange(&g_sharedCtrl->paused, 0, 0) != 0);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_PAUSE, isPaused ? L"Resume Folder Sizes" : L"Pause Folder Sizes");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_CLEAR_CACHE, L"Clear Size Cache");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
@@ -129,14 +297,8 @@ void ShowTrayContextMenu(HWND hwnd) {
 
 LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (g_msgTaskbarCreated != 0 && msg == g_msgTaskbarCreated) {
-        // Explorer restarted or crashed: restore tray icon and reconnect tracking
         AddOrRestoreTrayIcon();
-        if (g_renderer) {
-            g_renderer->TrimResources();
-        }
-        if (g_tracker) {
-            g_tracker->RequestRefresh();
-        }
+        SyncExplorerHooks();
         return 0;
     }
 
@@ -145,30 +307,36 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU) {
             ShowTrayContextMenu(hwnd);
         } else if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
-            if (g_tracker) {
-                g_tracker->SetPaused(!g_tracker->IsPaused());
+            if (g_sharedCtrl) {
+                bool isPaused = (InterlockedCompareExchange(&g_sharedCtrl->paused, 0, 0) != 0);
+                InterlockedExchange(&g_sharedCtrl->paused, isPaused ? 0 : 1);
             }
+            RefreshAllExplorerWindows();
         }
         return 0;
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case ID_TRAY_PAUSE:
-            if (g_tracker) {
-                g_tracker->SetPaused(!g_tracker->IsPaused());
+            if (g_sharedCtrl) {
+                bool isPaused = (InterlockedCompareExchange(&g_sharedCtrl->paused, 0, 0) != 0);
+                InterlockedExchange(&g_sharedCtrl->paused, isPaused ? 0 : 1);
             }
+            RefreshAllExplorerWindows();
             break;
         case ID_TRAY_CLEAR_CACHE:
-            if (g_calculator) {
-                g_calculator->ClearCache();
+            if (g_sharedCtrl) {
+                InterlockedIncrement(&g_sharedCtrl->clearCacheSeq);
             }
-            if (g_renderer) {
-                g_renderer->TrimResources();
-            }
+            EnumWindows([](HWND h, LPARAM) -> BOOL {
+                wchar_t cls[64]{};
+                if (GetClassNameW(h, cls, ARRAYSIZE(cls)) > 0 && wcscmp(cls, L"CabinetWClass") == 0) {
+                    PostMessageW(h, WM_NULL, 0, 0);
+                }
+                return TRUE;
+            }, 0);
+            RefreshAllExplorerWindows();
             TrimProcessMemory();
-            if (g_tracker) {
-                g_tracker->RequestRefresh();
-            }
             break;
         case ID_TRAY_AUTOSTART:
             SetAutoStartEnabled(!IsAutoStartEnabled());
@@ -180,51 +348,22 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_TIMER:
-        if (wParam == ExplorerTracker::kRefreshTimerId) {
-            KillTimer(hwnd, ExplorerTracker::kRefreshTimerId);
-            if (g_tracker) {
-                g_tracker->OnTimerTick();
-            }
-        } else if (wParam == ExplorerTracker::kPeriodicTimerId) {
-            if (g_tracker) {
-                g_tracker->OnTimerTick();
-            }
+        if (wParam == kSyncTimerId) {
+            SyncExplorerHooks();
         } else if (wParam == kIdleTrimTimerId) {
-            const bool activeNow = IsExplorerForeground();
-            if (!activeNow && g_wasExplorerActive) {
-                if (g_renderer) {
-                    g_renderer->TrimResources();
-                }
-                TrimProcessMemory();
-            }
-            g_wasExplorerActive = activeNow;
-        }
-        return 0;
-
-    case WM_ASYNC_SIZE_UPDATED:
-        if (g_tracker) {
-            g_tracker->RequestRefresh();
+            TrimProcessMemory();
         }
         return 0;
 
     case WM_DISPLAYCHANGE:
     case WM_SETTINGCHANGE:
-        if (g_renderer) {
-            g_renderer->TrimResources();
-        }
-        if (g_tracker) {
-            g_tracker->RequestRefresh();
-        }
+        SyncExplorerHooks();
         return 0;
 
     case WM_POWERBROADCAST:
         if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
-            if (g_renderer) {
-                g_renderer->TrimResources();
-            }
-            if (g_tracker) {
-                g_tracker->RequestRefresh();
-            }
+            SyncExplorerHooks();
+            RefreshAllExplorerWindows();
         }
         return TRUE;
 
@@ -238,7 +377,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_DESTROY:
+        KillTimer(hwnd, kSyncTimerId);
         KillTimer(hwnd, kIdleTrimTimerId);
+        ShutdownHooks();
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
         return 0;
@@ -247,7 +388,11 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 }
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR /*pCmdLine*/, int /*nCmdShow*/) {
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
+    UNREFERENCED_PARAMETER(hPrevInstance);
+    UNREFERENCED_PARAMETER(pCmdLine);
+    UNREFERENCED_PARAMETER(nCmdShow);
+
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, kMutexName);
@@ -289,8 +434,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR /*pC
     wc.hIconSm = hAppIconSmall;
     RegisterClassExW(&wc);
 
-    // Use a hidden top-level toolwindow (not HWND_MESSAGE) so Windows delivers TaskbarCreated,
-    // WM_DISPLAYCHANGE, WM_SETTINGCHANGE, and WM_POWERBROADCAST broadcasts.
     HWND msgHwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         kWndClassName,
@@ -322,20 +465,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR /*pC
     wcscpy_s(g_nid.szTip, L"Explorer Folder Size (Win10/Win11)");
     AddOrRestoreTrayIcon();
 
-    SizeCalculator calculator([msgHwnd]() {
-        PostMessageW(msgHwnd, WM_ASYNC_SIZE_UPDATED, 0, 0);
-    });
-    OverlayRenderer renderer;
-    ExplorerTracker tracker(calculator, renderer);
+    InitSharedControl();
+    LoadHookDll();
+    SyncExplorerHooks();
 
-    g_calculator = &calculator;
-    g_renderer = &renderer;
-    g_tracker = &tracker;
+    g_hWinEventHook = SetWinEventHook(
+        EVENT_OBJECT_CREATE,
+        EVENT_OBJECT_SHOW,
+        nullptr,
+        WinEventProc,
+        0,
+        0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
-    renderer.Initialize(hInstance);
-    tracker.Initialize(msgHwnd);
-
-    SetTimer(msgHwnd, kIdleTrimTimerId, 10000, nullptr);
+    SetTimer(msgHwnd, kSyncTimerId, 2000, nullptr);
+    SetTimer(msgHwnd, kIdleTrimTimerId, 30000, nullptr);
     TrimProcessMemory();
 
     MSG msg{};
@@ -343,12 +487,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR /*pC
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-
-    tracker.Shutdown();
-    renderer.Shutdown();
-    g_tracker = nullptr;
-    g_renderer = nullptr;
-    g_calculator = nullptr;
 
     if (hAppIconSmall) DestroyIcon(hAppIconSmall);
     if (hAppIconLarge) DestroyIcon(hAppIconLarge);

@@ -5,15 +5,15 @@
 </p>
 
 <p align="center">
-  <strong>Ultra-lightweight, hardware-accelerated folder size display for Windows 11 & 10 File Explorer.</strong><br>
-  Renders folder sizes natively in File Explorer's Details view with zero DLL injection, zero system hooks, and zero impact on native Explorer behavior.
+  <strong>Native, zero-lag in-process folder size display & adaptive file size formatting for Windows 11 & 10 File Explorer.</strong><br>
+  Natively populates folder sizes directly inside File Explorer's Details view with zero scroll lag, zero column resize stutter, and adaptive KB/MB/GB/TB size formatting.
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Platform-Windows%2011%20%7C%2010-0078D6?logo=windows" alt="Windows Platform" />
   <img src="https://img.shields.io/badge/Language-C%2B%2B20-blue?logo=c%2B%2B" alt="C++20" />
-  <img src="https://img.shields.io/badge/Renderer-Direct2D%20%2F%20DirectWrite-00A4EF" alt="Direct2D" />
-  <img src="https://img.shields.io/badge/RAM%20Usage-~350%20KB-success" alt="RAM Usage" />
+  <img src="https://img.shields.io/badge/Architecture-In--Process%20Shell%20Hook-00A4EF" alt="In-Process Shell Hook" />
+  <img src="https://img.shields.io/badge/RAM%20Usage-~2%20MB-success" alt="RAM Usage" />
   <img src="https://img.shields.io/badge/License-MIT-green" alt="MIT License" />
 </p>
 
@@ -21,14 +21,13 @@
 
 ## ⚡ Key Highlights
 
-- **Pure Transparent Overlay**: Direct2D hardware-accelerated text rendering aligned directly into the native File Explorer **Size** column. Only empty folder size cells are drawn—all file rows, native hover states, and selection pill borders remain 100% native Windows rendering.
-- **Fluid Monitor Refresh Rate Dragging (60Hz / 144Hz / 240Hz)**: Column divider dragging and window resizing adapt dynamically to your display's native refresh rate via lightweight `OBJID_CURSOR` tracking with zero stutter.
-- **Geometric Capacity Buffering**: Column widening uses over-allocated capacity buffers to eliminate per-pixel GDI/DIBSection reallocation stutter during drags.
-- **Native DirectWrite Ellipsis Trimming**: Shrinking columns narrow automatically trims folder size text with clean character-level ellipsis (`...`).
-- **High-Performance Multi-Threaded Engine**: Calculates folder sizes asynchronously using `FindFirstFileExW` with `FIND_FIRST_EX_LARGE_FETCH` and verifies directory write times (`ftLastWriteTime`) for instant cache retrieval.
-- **Extremely Low Memory & Zero Idle CPU**: Active working set trimming keeps RAM consumption at **~350 KB – 1.5 MB** with **0.0% CPU** when idle.
-- **Non-Invasive Architecture**: Runs as a standalone desktop utility—**no DLL injection**, **no shell namespace extensions**, and **no invasive API hooking** that could trigger antivirus or anti-cheat flags.
-- **Windows 11 Tabs & Dark/Light Mode Aware**: Seamlessly resolves tabs in Windows 11 File Explorer (`ShellTabWindowClass`) and dynamically switches text colors to match the Windows theme.
+- **100% Native Details View Integration**: Renders directly inside File Explorer's native list view cells. Native hover pills, multiselect highlights, focus rectangles, and theming remain 100% untouched.
+- **Zero Scroll Stutter & Zero Column Resize Lag**: Eliminates external transparent overlay windows and UI Automation walks. Vertical scrollbar drags and horizontal column divider resizes operate at your monitor's native refresh rate (60Hz / 120Hz / 144Hz / 240Hz) with 0ms lag.
+- **Adaptive Size Formatting (KB / MB / GB / TB)**: Extends Windows Explorer's native `Size` column to format large files (>= 1 MB) and folders with adaptive units (`50.0 MB`, `2.50 GB`, `1.20 TB`) while preserving native KB display for smaller files (`< 1 MB`).
+- **High-Performance Multi-Threaded Engine**: Asynchronously calculates folder sizes in the background using `FindFirstFileExW` with `FIND_FIRST_EX_LARGE_FETCH` and validates directory write times (`ftLastWriteTime`) for instant cache retrieval.
+- **Instant Shell Change Notification**: As soon as a folder's size calculation finishes in the background, `SHChangeNotify` instructs File Explorer to invalidate and re-query that specific row immediately.
+- **Ultra-Lightweight System Tray Host**: `ExplorerFolderSize.exe` operates as a minimal tray host (~44 KB binary, ~2 MB RAM) managing the injection and lifecycle of `ExplorerFolderSizeHook.dll`.
+- **Safe Dynamic Detours**: Safely detours `PSFormatForDisplay`, `CFSPropertyStore::GetValue`, and `CFSFolder::GetDetailsEx` with re-entrancy protection and clean unhooking on shutdown.
 
 ---
 
@@ -36,48 +35,35 @@
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│             Windows 11 / 10 File Explorer              │
-│ (CabinetWClass -> ShellTabWindowClass -> DirectUIHWND) │
+│           ExplorerFolderSize.exe (Tray Host)           │
+│  - System tray menu (Pause, Clear Cache, Autostart)    │
+│  - Discovers Explorer threads & installs CallWndProc   │
+│  - Shared IPC Control (Local\Win11ExplorerFolderSize)  │
 └───────────────────────────┬────────────────────────────┘
-                            │
-               UIA Bounds & Window Tracking
-               (EVENT_OBJECT_LOCATIONCHANGE / OBJID_CURSOR)
-                            │
+                            │ SetWindowsHookEx (WH_CALLWNDPROC)
                             ▼
-              ┌───────────────────────────┐
-              │      ExplorerTracker      │
-              │  - Frame pacing (QPC)     │
-              │  - Fast Geometry Path     │
-              │  - Header & Tab Cache     │
-              └─────────────┬─────────────┘
-                            │
-             ┌──────────────┴──────────────┐
-             ▼                             ▼
-┌───────────────────────────┐ ┌───────────────────────────┐
-│      SizeCalculator       │ │      OverlayRenderer      │
-│  - Worker Thread Pool     │ │  - Direct2D / DirectWrite │
-│  - FindFirstFileExW Fetch │ │  - Capacity DIBSection    │
-│  - Write-Time Cache       │ │  - WS_EX_LAYERED Overlay  │
-└───────────────────────────┘ └───────────────────────────┘
+┌────────────────────────────────────────────────────────┐
+│          ExplorerFolderSizeHook.dll (explorer.exe)     │
+│  - IAT Hook: PSFormatForDisplay (propsys.dll)          │
+│  - Vtable Hook: CFSPropertyStore::GetValue (Slot 5)    │
+│  - Vtable Hook: CFSFolder::GetDetailsEx (Slot 17)      │
+│  - Async SizeCalculator Thread Pool                    │
+│  - SHChangeNotify(SHCNE_UPDATEITEM) on completion      │
+└────────────────────────────────────────────────────────┘
 ```
 
-1. **Window & Column Tracking (`ExplorerTracker`)**: Monitors the active File Explorer window using lightweight WinEvents and UI Automation caching. Live cursor motion (`OBJID_CURSOR`) drives updates during column divider dragging without polling.
-2. **Fast Geometry Path (`TryFastGeometryRefresh`)**: When dragging dividers or moving the window, geometry calculations execute in **~60 µs**, completely bypassing full UI Automation tree walks.
-3. **Background Calculation (`SizeCalculator`)**: Directories are traversed asynchronously across background worker threads. Results are cached and validated against the folder's write timestamp.
-4. **Transparent Rendering (`OverlayRenderer`)**: A click-through, non-activating layered window (`WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE`) renders folder size text with sub-pixel DirectWrite anti-aliasing directly over the Explorer viewport.
+1. **In-Process Shell Detours**: When loaded into `explorer.exe`, `ExplorerFolderSizeHook.dll` intercepts Explorer's queries for `PKEY_Size`.
+2. **Adaptive Formatting**: For files >= 1 MB, clearing `PDFF_ALWAYSKB` instructs Windows Property System (`propsys.dll`) to display natural MB/GB/TB units.
+3. **Async Folder Sizes**: Folders query the in-process `SizeCalculator`. If cached, the size is returned immediately. If calculating, background worker threads compute the directory size and dispatch `SHChangeNotify` to trigger an instant single-item refresh.
 
 ---
 
 ## 🚀 Getting Started
 
-### Prerequisites
-- **Operating System**: Windows 11 or Windows 10 (version 1809 or later)
-- **File Explorer View**: Details view with the **Size** column enabled.
-
-### Running Pre-Built Binary
-1. Download `ExplorerFolderSize.exe` from the latest release.
+### Running Pre-Built Binaries
+1. Place `ExplorerFolderSize.exe` and `ExplorerFolderSizeHook.dll` together in the same directory.
 2. Run `ExplorerFolderSize.exe`.
-3. Open Windows File Explorer, switch to **Details** view, and ensure the **Size** column is visible. Folder sizes will appear seamlessly!
+3. Open Windows File Explorer, switch to **Details** view, and ensure the **Size** column is visible. Folder sizes and adaptive formatting appear automatically!
 
 ---
 
@@ -85,15 +71,11 @@
 
 Explorer Folder Size lives unobtrusively in your system tray:
 
-<p align="center">
-  <img src="assets/icon.svg" width="48" height="48" alt="Tray Icon" />
-</p>
-
 Right-click the tray icon to access:
-- **Pause Folder Sizes**: Temporarily hides the overlay and suspends folder tracking.
+- **Pause Folder Sizes**: Temporarily suspends custom formatting and restores native Explorer behavior.
 - **Clear Size Cache**: Flushes in-memory folder size caches to force recalculation.
 - **Run at Windows Startup**: Toggles automatic startup with Windows (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`).
-- **Exit**: Unloads the overlay and gracefully terminates the application.
+- **Exit**: Unhooks `explorer.exe` threads cleanly and terminates the tray application.
 
 ---
 
@@ -113,12 +95,13 @@ cd win--10-11-explorer-folder-size
 # 2. Configure with CMake
 cmake -B build -G "Visual Studio 17 2022" -A x64
 
-# 3. Build Release binary
+# 3. Build Release binaries
 cmake --build build --config Release
 ```
 
-The optimized executable will be generated at:
-`build/Release/ExplorerFolderSize.exe`
+The optimized binaries will be generated in `build/Release/`:
+- `ExplorerFolderSize.exe` (Tray Host)
+- `ExplorerFolderSizeHook.dll` (In-Process Hook)
 
 ---
 
@@ -127,18 +110,16 @@ The optimized executable will be generated at:
 ```
 win11-explorer-folder-size/
 ├── assets/
-│   ├── icon.svg             # 2D flat vector master icon
-│   └── icon.ico             # Multi-res embedded Windows icon (16, 24, 32, 48, 256 px)
+│   ├── icon.svg             # Vector master icon
+│   └── icon.ico             # Embedded multi-resolution icon
 ├── src/
-│   ├── main.cpp             # WinMain entry, tray manager, and message loop
-│   ├── app.rc               # Windows resource definitions (App & Tray Icon)
-│   ├── resource.h           # Resource identifiers
-│   ├── ExplorerTracker.h    # Explorer window & header tracking interface
-│   ├── ExplorerTracker.cpp  # WinEvent pacing, UIA tracking, and fast geometry refresh
-│   ├── OverlayRenderer.h    # Direct2D transparent layered window overlay header
-│   ├── OverlayRenderer.cpp  # Direct2D/DirectWrite rendering with capacity buffering
+│   ├── main.cpp             # Tray host, hook injection & IPC manager
+│   ├── ShellHook.h          # Shared IPC struct & export declarations
+│   ├── ShellHookDll.cpp     # In-process Shell & Property System hook DLL
 │   ├── SizeCalculator.h     # Multi-threaded folder size calculation header
-│   └── SizeCalculator.cpp   # FindFirstFileExW async calculation and timestamp cache
+│   ├── SizeCalculator.cpp   # FindFirstFileExW async engine & SHChangeNotify
+│   ├── app.rc               # Windows resource definitions (App & Tray Icon)
+│   └── resource.h           # Resource identifiers
 ├── CMakeLists.txt           # CMake build script
 ├── .gitignore               # Git ignore rules
 ├── LICENSE                  # MIT License
@@ -149,4 +130,4 @@ win11-explorer-folder-size/
 
 ## 📄 License
 
-This project is licensed under the [MIT License](LICENSE) - feel free to use, modify, and distribute as you see fit.
+This project is licensed under the [MIT License](LICENSE).

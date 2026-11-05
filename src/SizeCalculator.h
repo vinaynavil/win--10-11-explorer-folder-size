@@ -27,8 +27,10 @@ struct FolderSizeResult {
 class SizeCalculator {
 public:
     using UpdateCallback = std::function<void()>;
+    using PathUpdateCallback = std::function<void(const std::wstring&)>;
 
     explicit SizeCalculator(UpdateCallback onUpdateCallback);
+    explicit SizeCalculator(PathUpdateCallback onPathUpdateCallback);
     ~SizeCalculator();
 
     FolderSizeResult RequestFolderSize(const std::wstring& folderPath);
@@ -50,6 +52,7 @@ private:
     static std::wstring ToLongPath(const std::wstring& path);
 
     UpdateCallback m_onUpdate;
+    PathUpdateCallback m_onPathUpdate;
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
     std::unordered_map<std::wstring, CacheEntry> m_cache;

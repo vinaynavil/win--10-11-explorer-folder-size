@@ -5,6 +5,7 @@ out/
 x64/
 Debug/
 Release/
+*.obj
 
 # Visual Studio & CMake intermediate files
 .vs/

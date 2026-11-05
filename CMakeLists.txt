@@ -9,12 +9,7 @@ add_compile_definitions(UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
 add_executable(ExplorerFolderSize WIN32
     src/main.cpp
-    src/ExplorerTracker.h
-    src/ExplorerTracker.cpp
-    src/SizeCalculator.h
-    src/SizeCalculator.cpp
-    src/OverlayRenderer.h
-    src/OverlayRenderer.cpp
+    src/ShellHook.h
     src/resource.h
     src/app.rc
 )
@@ -31,9 +26,30 @@ target_link_libraries(ExplorerFolderSize PRIVATE
     ole32
     oleaut32
     uuid
-    d2d1
-    dwrite
-    dwmapi
     shlwapi
+    advapi32
+)
+
+add_library(ExplorerFolderSizeHook SHARED
+    src/ShellHook.h
+    src/ShellHookDll.cpp
+    src/SizeCalculator.h
+    src/SizeCalculator.cpp
+)
+
+target_compile_definitions(ExplorerFolderSizeHook PRIVATE EXPLORERFOLDERSIZEHOOK_EXPORTS)
+
+if(MSVC)
+    target_compile_options(ExplorerFolderSizeHook PRIVATE /W4 /MP /utf-8 /permissive-)
+endif()
+
+target_link_libraries(ExplorerFolderSizeHook PRIVATE
+    user32
+    shell32
+    ole32
+    oleaut32
+    propsys
+    shlwapi
+    uuid
     advapi32
 )
