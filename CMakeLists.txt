@@ -15,7 +15,8 @@ add_executable(ExplorerFolderSize WIN32
 )
 
 if(MSVC)
-    target_compile_options(ExplorerFolderSize PRIVATE /W4 /MP /utf-8 /permissive-)
+    target_compile_options(ExplorerFolderSize PRIVATE /W4 /MP /utf-8 /permissive- $<$<CONFIG:Release>:/O2 /Oi /GL /Gy>)
+    target_link_options(ExplorerFolderSize PRIVATE $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>)
     set_property(TARGET ExplorerFolderSize PROPERTY VS_DPI_AWARE "PerMonitor")
 endif()
 
@@ -40,7 +41,8 @@ add_library(ExplorerFolderSizeHook SHARED
 target_compile_definitions(ExplorerFolderSizeHook PRIVATE EXPLORERFOLDERSIZEHOOK_EXPORTS)
 
 if(MSVC)
-    target_compile_options(ExplorerFolderSizeHook PRIVATE /W4 /MP /utf-8 /permissive-)
+    target_compile_options(ExplorerFolderSizeHook PRIVATE /W4 /MP /utf-8 /permissive- $<$<CONFIG:Release>:/O2 /Oi /GL /Gy>)
+    target_link_options(ExplorerFolderSizeHook PRIVATE $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>)
 endif()
 
 target_link_libraries(ExplorerFolderSizeHook PRIVATE

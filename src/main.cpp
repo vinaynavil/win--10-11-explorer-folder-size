@@ -3,7 +3,10 @@
 #include <shlobj.h>
 #include <objbase.h>
 #include <string>
+#include <vector>
 #include <unordered_map>
+#include <algorithm>
+#include <cwctype>
 
 #include "resource.h"
 #include "ShellHook.h"
@@ -15,14 +18,16 @@ constexpr UINT ID_TRAY_PAUSE = 1001;
 constexpr UINT ID_TRAY_CLEAR_CACHE = 1002;
 constexpr UINT ID_TRAY_AUTOSTART = 1003;
 constexpr UINT ID_TRAY_EXIT = 1004;
+constexpr UINT ID_TRAY_UNINSTALL = 1005;
 
-constexpr UINT_PTR kIdleTrimTimerId = 3001;
-constexpr UINT_PTR kSyncTimerId = 3002;
+constexpr UINT_PTR kStartupDelayTimerId = 3003;
 
 constexpr wchar_t kMutexName[] = L"Local\\Win11ExplorerFolderSize_SingleInstance_Mutex";
 constexpr wchar_t kWndClassName[] = L"Win11ExplorerFolderSizeMsgWnd";
 constexpr wchar_t kRunRegKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-constexpr wchar_t kRunAppName[] = L"ExplorerFolderSize";
+constexpr wchar_t kStartupApprovedRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
+constexpr wchar_t kRunAppName[] = L"Explorer Folder Size";
+constexpr wchar_t kLegacyRunAppName[] = L"ExplorerFolderSize";
 
 NOTIFYICONDATAW g_nid{};
 UINT g_msgTaskbarCreated = 0;
@@ -36,7 +41,8 @@ using PFN_NotifyExplorerRefresh = void (CALLBACK*)();
 PFN_NotifyExplorerRefresh g_notifyRefresh = nullptr;
 
 std::unordered_map<DWORD, HHOOK> g_threadHooks;
-HWINEVENTHOOK g_hWinEventHook = nullptr;
+HWINEVENTHOOK g_hWinEventFg = nullptr;
+HWINEVENTHOOK g_hWinEventShow = nullptr;
 
 void TrimProcessMemory() {
     SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
@@ -53,6 +59,24 @@ std::wstring GetQuotedExePath() {
     return L"\"" + std::wstring(exePath) + L"\"";
 }
 
+void PurgeLegacyAndTelemetryEntries(bool removeAll) {
+    HKEY hRunKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunRegKey, 0, KEY_SET_VALUE, &hRunKey) == ERROR_SUCCESS) {
+        RegDeleteValueW(hRunKey, kLegacyRunAppName);
+        if (removeAll) {
+            RegDeleteValueW(hRunKey, kRunAppName);
+        }
+        RegCloseKey(hRunKey);
+    }
+
+    HKEY hStartupKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kStartupApprovedRunKey, 0, KEY_SET_VALUE, &hStartupKey) == ERROR_SUCCESS) {
+        RegDeleteValueW(hStartupKey, kLegacyRunAppName);
+        RegDeleteValueW(hStartupKey, kRunAppName);
+        RegCloseKey(hStartupKey);
+    }
+}
+
 bool IsAutoStartEnabled() {
     HKEY hKey = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunRegKey, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
@@ -61,24 +85,28 @@ bool IsAutoStartEnabled() {
     wchar_t val[MAX_PATH + 8]{};
     DWORD size = sizeof(val);
     LSTATUS status = RegQueryValueExW(hKey, kRunAppName, nullptr, nullptr, reinterpret_cast<LPBYTE>(val), &size);
+    if (status != ERROR_SUCCESS) {
+        size = sizeof(val);
+        status = RegQueryValueExW(hKey, kLegacyRunAppName, nullptr, nullptr, reinterpret_cast<LPBYTE>(val), &size);
+    }
     RegCloseKey(hKey);
     return (status == ERROR_SUCCESS);
 }
 
 void SetAutoStartEnabled(bool enable) {
-    HKEY hKey = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunRegKey, 0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) {
-        return;
-    }
     if (enable) {
-        const std::wstring cmd = GetQuotedExePath();
-        RegSetValueExW(hKey, kRunAppName, 0, REG_SZ,
-            reinterpret_cast<const BYTE*>(cmd.c_str()),
-            static_cast<DWORD>((cmd.size() + 1) * sizeof(wchar_t)));
+        HKEY hKey = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunRegKey, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+            const std::wstring cmd = GetQuotedExePath();
+            RegSetValueExW(hKey, kRunAppName, 0, REG_SZ,
+                reinterpret_cast<const BYTE*>(cmd.c_str()),
+                static_cast<DWORD>((cmd.size() + 1) * sizeof(wchar_t)));
+            RegCloseKey(hKey);
+        }
+        PurgeLegacyAndTelemetryEntries(false);
     } else {
-        RegDeleteValueW(hKey, kRunAppName);
+        PurgeLegacyAndTelemetryEntries(true);
     }
-    RegCloseKey(hKey);
 }
 
 void SyncAutoStartPathIfEnabled() {
@@ -89,19 +117,29 @@ void SyncAutoStartPathIfEnabled() {
     wchar_t existingVal[MAX_PATH + 8]{};
     DWORD size = sizeof(existingVal);
     DWORD type = 0;
-    if (RegQueryValueExW(hKey, kRunAppName, nullptr, &type, reinterpret_cast<LPBYTE>(existingVal), &size) == ERROR_SUCCESS &&
-        type == REG_SZ) {
+    bool hasLegacy = (RegQueryValueExW(hKey, kLegacyRunAppName, nullptr, &type, reinterpret_cast<LPBYTE>(existingVal), &size) == ERROR_SUCCESS && type == REG_SZ);
+    bool hasModern = false;
+    if (!hasLegacy) {
+        size = sizeof(existingVal);
+        hasModern = (RegQueryValueExW(hKey, kRunAppName, nullptr, &type, reinterpret_cast<LPBYTE>(existingVal), &size) == ERROR_SUCCESS && type == REG_SZ);
+    }
+
+    if (hasLegacy || hasModern) {
         const std::wstring expected = GetQuotedExePath();
-        if (_wcsicmp(existingVal, expected.c_str()) != 0) {
+        if (hasLegacy || _wcsicmp(existingVal, expected.c_str()) != 0) {
             RegSetValueExW(hKey, kRunAppName, 0, REG_SZ,
                 reinterpret_cast<const BYTE*>(expected.c_str()),
                 static_cast<DWORD>((expected.size() + 1) * sizeof(wchar_t)));
         }
+        RegCloseKey(hKey);
+        PurgeLegacyAndTelemetryEntries(false);
+    } else {
+        RegCloseKey(hKey);
     }
-    RegCloseKey(hKey);
 }
 
 void InitSharedControl() {
+    if (g_sharedCtrl) return;
     g_hSharedMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(SharedHookControl), kSharedHookControlName);
     if (!g_hSharedMap) {
         g_hSharedMap = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, kSharedHookControlName);
@@ -117,6 +155,7 @@ void InitSharedControl() {
 }
 
 bool LoadHookDll() {
+    if (g_hHookDll && g_hookProc) return true;
     wchar_t exePath[MAX_PATH]{};
     if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) == 0) return false;
     wchar_t* lastSlash = wcsrchr(exePath, L'\\');
@@ -152,9 +191,50 @@ void RefreshAllExplorerWindows() {
 }
 
 void SyncExplorerHooks() {
-    if (!g_hookProc || !g_hHookDll) return;
+    // 1. Discover active CabinetWClass windows
+    std::vector<HWND> explorerWindows;
+    explorerWindows.reserve(8);
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        if (!IsWindowVisible(hwnd)) return TRUE;
+        wchar_t cls[64]{};
+        if (GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) > 0 && wcscmp(cls, L"CabinetWClass") == 0) {
+            auto* pVec = reinterpret_cast<std::vector<HWND>*>(lParam);
+            pVec->push_back(hwnd);
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&explorerWindows));
 
-    // 1. Prune dead thread IDs
+    // If no Explorer windows exist, prune dead threads and return early without loading DLL
+    if (explorerWindows.empty()) {
+        if (g_threadHooks.empty()) {
+            return;
+        }
+        for (auto it = g_threadHooks.begin(); it != g_threadHooks.end(); ) {
+            HANDLE hThread = OpenThread(SYNCHRONIZE, FALSE, it->first);
+            if (!hThread) {
+                UnhookWindowsHookEx(it->second);
+                it = g_threadHooks.erase(it);
+            } else {
+                DWORD waitRes = WaitForSingleObject(hThread, 0);
+                CloseHandle(hThread);
+                if (waitRes == WAIT_OBJECT_0) {
+                    UnhookWindowsHookEx(it->second);
+                    it = g_threadHooks.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        return;
+    }
+
+    // At least one CabinetWClass window exists: ensure shared control & hook DLL are loaded
+    InitSharedControl();
+    if (!LoadHookDll() || !g_hookProc || !g_hHookDll) {
+        return;
+    }
+
+    // 2. Prune dead thread IDs
     for (auto it = g_threadHooks.begin(); it != g_threadHooks.end(); ) {
         HANDLE hThread = OpenThread(SYNCHRONIZE, FALSE, it->first);
         if (!hThread) {
@@ -172,9 +252,9 @@ void SyncExplorerHooks() {
         }
     }
 
-    // 2. Discover and hook active Explorer threads
-    auto HookThreadIfNew = [](HWND hwnd) {
-        if (!hwnd || !IsWindow(hwnd)) return;
+    // 3. Hook newly discovered Explorer window threads
+    size_t newThreadsHooked = 0;
+    for (HWND hwnd : explorerWindows) {
         DWORD pid = 0;
         DWORD threadId = GetWindowThreadProcessId(hwnd, &pid);
         if (threadId != 0 && pid != 0 && pid != GetCurrentProcessId()) {
@@ -182,31 +262,26 @@ void SyncExplorerHooks() {
                 HHOOK hHook = SetWindowsHookExW(WH_CALLWNDPROC, g_hookProc, g_hHookDll, threadId);
                 if (hHook) {
                     g_threadHooks[threadId] = hHook;
+                    ++newThreadsHooked;
                     SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, nullptr);
                 }
             }
         }
-    };
-
-    HWND shellHwnd = GetShellWindow();
-    if (shellHwnd) {
-        HookThreadIfNew(shellHwnd);
     }
 
-    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
-        auto* pHookFunc = reinterpret_cast<decltype(HookThreadIfNew)*>(lParam);
-        wchar_t cls[64]{};
-        if (GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) > 0 && wcscmp(cls, L"CabinetWClass") == 0) {
-            (*pHookFunc)(hwnd);
-        }
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&HookThreadIfNew));
+    if (newThreadsHooked > 0) {
+        TrimProcessMemory();
+    }
 }
 
 void ShutdownHooks() {
-    if (g_hWinEventHook) {
-        UnhookWinEvent(g_hWinEventHook);
-        g_hWinEventHook = nullptr;
+    if (g_hWinEventFg) {
+        UnhookWinEvent(g_hWinEventFg);
+        g_hWinEventFg = nullptr;
+    }
+    if (g_hWinEventShow) {
+        UnhookWinEvent(g_hWinEventShow);
+        g_hWinEventShow = nullptr;
     }
 
     if (g_sharedCtrl) {
@@ -229,10 +304,7 @@ void ShutdownHooks() {
         return TRUE;
     }, 0);
 
-    HWND shellHwnd = GetShellWindow();
-    if (shellHwnd) {
-        SendMessageTimeoutW(shellHwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, nullptr);
-    }
+    RefreshAllExplorerWindows();
 
     if (g_hHookDll) {
         FreeLibrary(g_hHookDll);
@@ -259,16 +331,16 @@ void CALLBACK WinEventProc(
 {
     UNREFERENCED_PARAMETER(hWinEventHook);
     UNREFERENCED_PARAMETER(event);
-    UNREFERENCED_PARAMETER(idObject);
-    UNREFERENCED_PARAMETER(idChild);
     UNREFERENCED_PARAMETER(idEventThread);
     UNREFERENCED_PARAMETER(dwmsEventTime);
 
-    if (hwnd) {
-        wchar_t cls[64]{};
-        if (GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) > 0 && wcscmp(cls, L"CabinetWClass") == 0) {
-            SyncExplorerHooks();
-        }
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !hwnd) {
+        return;
+    }
+
+    wchar_t cls[64]{};
+    if (GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) > 0 && wcscmp(cls, L"CabinetWClass") == 0) {
+        SyncExplorerHooks();
     }
 }
 
@@ -287,6 +359,7 @@ void ShowTrayContextMenu(HWND hwnd) {
     UINT autoStartFlags = MF_STRING | (IsAutoStartEnabled() ? MF_CHECKED : MF_UNCHECKED);
     AppendMenuW(hMenu, autoStartFlags, ID_TRAY_AUTOSTART, L"Run at Windows Startup");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_UNINSTALL, L"Uninstall && Clean Up...");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"Exit");
 
     SetForegroundWindow(hwnd);
@@ -341,6 +414,19 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         case ID_TRAY_AUTOSTART:
             SetAutoStartEnabled(!IsAutoStartEnabled());
             break;
+        case ID_TRAY_UNINSTALL: {
+            int resp = MessageBoxW(
+                hwnd,
+                L"This will remove Explorer Folder Size from Windows startup, unhook File Explorer, and close the app so you can safely delete its files.\n\nProceed with uninstall cleanup?",
+                L"Uninstall Explorer Folder Size",
+                MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2 | MB_SETFOREGROUND);
+            if (resp == IDYES) {
+                PurgeLegacyAndTelemetryEntries(true);
+                RefreshAllExplorerWindows();
+                DestroyWindow(hwnd);
+            }
+            break;
+        }
         case ID_TRAY_EXIT:
             DestroyWindow(hwnd);
             break;
@@ -348,9 +434,25 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_TIMER:
-        if (wParam == kSyncTimerId) {
+        if (wParam == kStartupDelayTimerId) {
+            KillTimer(hwnd, kStartupDelayTimerId);
+            g_hWinEventFg = SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_FOREGROUND,
+                nullptr,
+                WinEventProc,
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+            g_hWinEventShow = SetWinEventHook(
+                EVENT_OBJECT_SHOW,
+                EVENT_OBJECT_SHOW,
+                nullptr,
+                WinEventProc,
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
             SyncExplorerHooks();
-        } else if (wParam == kIdleTrimTimerId) {
             TrimProcessMemory();
         }
         return 0;
@@ -376,9 +478,12 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
 
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
     case WM_DESTROY:
-        KillTimer(hwnd, kSyncTimerId);
-        KillTimer(hwnd, kIdleTrimTimerId);
+        KillTimer(hwnd, kStartupDelayTimerId);
         ShutdownHooks();
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
@@ -390,8 +495,24 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     UNREFERENCED_PARAMETER(hPrevInstance);
-    UNREFERENCED_PARAMETER(pCmdLine);
     UNREFERENCED_PARAMETER(nCmdShow);
+
+    if (pCmdLine && *pCmdLine) {
+        std::wstring cmd(pCmdLine);
+        std::transform(cmd.begin(), cmd.end(), cmd.begin(), [](wchar_t c) { return static_cast<wchar_t>(::towlower(c)); });
+        if (cmd.find(L"--uninstall") != std::wstring::npos ||
+            cmd.find(L"/uninstall") != std::wstring::npos ||
+            cmd.find(L"-uninstall") != std::wstring::npos) {
+            PurgeLegacyAndTelemetryEntries(true);
+            HWND existingHwnd = FindWindowW(kWndClassName, nullptr);
+            if (existingHwnd) {
+                SendMessageTimeoutW(existingHwnd, WM_CLOSE, 0, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 2000, nullptr);
+                Sleep(500);
+            }
+            SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_FLUSHNOWAIT, nullptr, nullptr);
+            return 0;
+        }
+    }
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -465,21 +586,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     wcscpy_s(g_nid.szTip, L"Explorer Folder Size (Win10/Win11)");
     AddOrRestoreTrayIcon();
 
-    InitSharedControl();
-    LoadHookDll();
-    SyncExplorerHooks();
-
-    g_hWinEventHook = SetWinEventHook(
-        EVENT_OBJECT_CREATE,
-        EVENT_OBJECT_SHOW,
-        nullptr,
-        WinEventProc,
-        0,
-        0,
-        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-
-    SetTimer(msgHwnd, kSyncTimerId, 2000, nullptr);
-    SetTimer(msgHwnd, kIdleTrimTimerId, 30000, nullptr);
+    SetTimer(msgHwnd, kStartupDelayTimerId, 3500, nullptr);
     TrimProcessMemory();
 
     MSG msg{};

@@ -75,7 +75,13 @@ Right-click the tray icon to access:
 - **Pause Folder Sizes**: Temporarily suspends custom formatting and restores native Explorer behavior.
 - **Clear Size Cache**: Flushes in-memory folder size caches to force recalculation.
 - **Run at Windows Startup**: Toggles automatic startup with Windows (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`).
+- **Uninstall & Clean Up...**: Safely unhooks File Explorer, removes all Windows startup registry entries, and exits the app so binary files can be cleanly deleted.
 - **Exit**: Unhooks `explorer.exe` threads cleanly and terminates the tray application.
+
+You can also run uninstallation directly from PowerShell / Command Prompt:
+```powershell
+.\ExplorerFolderSize.exe --uninstall
+```
 
 ---
 

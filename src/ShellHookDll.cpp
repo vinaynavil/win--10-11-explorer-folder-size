@@ -429,43 +429,35 @@ HRESULT STDMETHODCALLTYPE Hook_CFSFolder_GetDetailsOf(
 bool TryDiscoverAndHookFolder(const wchar_t* dirPath) {
     if (!dirPath || dirPath[0] == L'\0') return false;
 
-    IShellItem* psi = nullptr;
-    if (FAILED(SHCreateItemFromParsingName(dirPath, nullptr, IID_PPV_ARGS(&psi))) || !psi) {
+    PIDLIST_ABSOLUTE pidlFull = nullptr;
+    if (FAILED(SHParseDisplayName(dirPath, nullptr, &pidlFull, 0, nullptr)) || !pidlFull) {
         return false;
     }
 
     IShellFolder2* psf2 = nullptr;
-    HRESULT hrBind = psi->BindToHandler(nullptr, BHID_SFObject, IID_PPV_ARGS(&psf2));
+    PCUITEMID_CHILD pidlChild = nullptr;
+    HRESULT hrBind = SHBindToParent(pidlFull, IID_PPV_ARGS(&psf2), &pidlChild);
     if (SUCCEEDED(hrBind) && psf2) {
         void** psf2Vtbl = *reinterpret_cast<void***>(psf2);
         PatchVtableSlot(psf2Vtbl, 17, reinterpret_cast<void*>(Hook_CFSFolder_GetDetailsEx), reinterpret_cast<void**>(&g_origCFSFolderGetDetailsEx));
         PatchVtableSlot(psf2Vtbl, 18, reinterpret_cast<void*>(Hook_CFSFolder_GetDetailsOf), reinterpret_cast<void**>(&g_origCFSFolderGetDetailsOf));
 
-        if (!g_origCFSPropStoreGetValue) {
-            IEnumIDList* pEnum = nullptr;
-            if (SUCCEEDED(psf2->EnumObjects(nullptr, SHCONTF_FOLDERS, &pEnum)) && pEnum) {
-                PITEMID_CHILD pidlChild = nullptr;
-                ULONG fetched = 0;
-                if (pEnum->Next(1, &pidlChild, &fetched) == S_OK && fetched == 1) {
-                    IPropertyStoreFactory* pItemFactory = nullptr;
-                    if (SUCCEEDED(psf2->BindToObject(pidlChild, nullptr, IID_IPropertyStoreFactory, reinterpret_cast<void**>(&pItemFactory))) && pItemFactory) {
-                        IPropertyStore* pStore = nullptr;
-                        PROPERTYKEY keys[] = { PKEY_Size };
-                        if (SUCCEEDED(pItemFactory->GetPropertyStoreForKeys(keys, 1, GPS_FASTPROPERTIESONLY | GPS_HANDLERPROPERTIESONLY, IID_PPV_ARGS(&pStore))) && pStore) {
-                            void** propStoreVtbl = *reinterpret_cast<void***>(pStore);
-                            PatchVtableSlot(propStoreVtbl, 5, reinterpret_cast<void*>(Hook_CFSPropertyStore_GetValue), reinterpret_cast<void**>(&g_origCFSPropStoreGetValue));
-                            pStore->Release();
-                        }
-                        pItemFactory->Release();
-                    }
-                    CoTaskMemFree(pidlChild);
+        if (!g_origCFSPropStoreGetValue && pidlChild) {
+            IPropertyStoreFactory* pItemFactory = nullptr;
+            if (SUCCEEDED(psf2->BindToObject(pidlChild, nullptr, IID_IPropertyStoreFactory, reinterpret_cast<void**>(&pItemFactory))) && pItemFactory) {
+                IPropertyStore* pStore = nullptr;
+                PROPERTYKEY keys[] = { PKEY_Size };
+                if (SUCCEEDED(pItemFactory->GetPropertyStoreForKeys(keys, 1, GPS_FASTPROPERTIESONLY | GPS_HANDLERPROPERTIESONLY, IID_PPV_ARGS(&pStore))) && pStore) {
+                    void** propStoreVtbl = *reinterpret_cast<void***>(pStore);
+                    PatchVtableSlot(propStoreVtbl, 5, reinterpret_cast<void*>(Hook_CFSPropertyStore_GetValue), reinterpret_cast<void**>(&g_origCFSPropStoreGetValue));
+                    pStore->Release();
                 }
-                pEnum->Release();
+                pItemFactory->Release();
             }
         }
         psf2->Release();
     }
-    psi->Release();
+    CoTaskMemFree(pidlFull);
     return (g_origCFSPropStoreGetValue != nullptr && g_origCFSFolderGetDetailsEx != nullptr);
 }
 

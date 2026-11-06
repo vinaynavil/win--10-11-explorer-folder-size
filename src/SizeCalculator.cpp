@@ -1,6 +1,7 @@
 #include "SizeCalculator.h"
 #include <cwchar>
 #include <algorithm>
+#include <processthreadsapi.h>
 
 SizeCalculator::SizeCalculator(UpdateCallback onUpdateCallback)
     : m_onUpdate(std::move(onUpdateCallback)) {
@@ -53,23 +54,31 @@ std::wstring SizeCalculator::ToLongPath(const std::wstring& path) {
 }
 
 FolderSizeResult SizeCalculator::RequestFolderSize(const std::wstring& folderPath) {
+    // Ignore UNC network paths (\\server\share) to prevent network stalls
+    if (folderPath.size() >= 2 && folderPath[0] == L'\\' && folderPath[1] == L'\\') {
+        if (folderPath.rfind(L"\\\\?\\", 0) != 0) {
+            return FolderSizeResult{ 0, CalculationStatus::Error, L"" };
+        }
+    }
+
     const ULONGLONG now = GetTickCount64();
-    const uint64_t currentWriteTime = GetFolderWriteTime(folderPath);
 
     std::lock_guard<std::mutex> lock(m_mutex);
     auto it = m_cache.find(folderPath);
     if (it != m_cache.end()) {
         CacheEntry& entry = it->second;
         if (entry.status == CalculationStatus::Ready) {
-            bool writeTimeUnchanged = (currentWriteTime != 0 && entry.folderWriteTime == currentWriteTime);
-            bool withinTtl = (now - entry.calculatedTick) < kCacheTtlMs;
-            if (writeTimeUnchanged && withinTtl) {
-                return FolderSizeResult{ entry.sizeBytes, entry.status, entry.formattedText };
+            if ((now - entry.calculatedTick) < kCacheTtlMs) {
+                // Pure RAM lookup (~20ns, 0 disk syscalls on caller UI thread)
+                return FolderSizeResult{ entry.sizeBytes, CalculationStatus::Ready, entry.formattedText };
             }
+            // TTL expired: queue background re-check while returning cached size immediately
             entry.status = CalculationStatus::Calculating;
-            entry.folderWriteTime = currentWriteTime;
             if (std::find(m_queue.begin(), m_queue.end(), folderPath) == m_queue.end()) {
                 m_queue.push_front(folderPath);
+                if (m_queue.size() > 128) {
+                    m_queue.pop_back();
+                }
                 m_cv.notify_one();
             }
             return FolderSizeResult{ entry.sizeBytes, CalculationStatus::Ready, entry.formattedText };
@@ -85,12 +94,15 @@ FolderSizeResult SizeCalculator::RequestFolderSize(const std::wstring& folderPat
     newEntry.sizeBytes = 0;
     newEntry.status = CalculationStatus::Calculating;
     newEntry.formattedText = L"...";
-    newEntry.folderWriteTime = currentWriteTime;
+    newEntry.folderWriteTime = 0;
     newEntry.calculatedTick = now;
     m_cache.emplace(folderPath, newEntry);
 
     if (std::find(m_queue.begin(), m_queue.end(), folderPath) == m_queue.end()) {
         m_queue.push_front(folderPath);
+        if (m_queue.size() > 128) {
+            m_queue.pop_back();
+        }
         m_cv.notify_one();
     }
 
@@ -107,6 +119,12 @@ void SizeCalculator::ClearCache() {
 void SizeCalculator::WorkerLoop() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
+    PROCESS_POWER_THROTTLING_STATE powerThrottling{};
+    powerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    powerThrottling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    powerThrottling.StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &powerThrottling, sizeof(powerThrottling));
+
     while (!m_stop.load(std::memory_order_acquire)) {
         std::wstring targetPath;
         {
@@ -121,19 +139,38 @@ void SizeCalculator::WorkerLoop() {
             m_queue.pop_front();
         }
 
-        uint64_t totalBytes = ComputeDirectorySize(targetPath);
-        std::wstring formatted = FormatSize(totalBytes);
-        uint64_t writeTime = GetFolderWriteTime(targetPath);
+        const uint64_t currentWriteTime = GetFolderWriteTime(targetPath);
+        bool canSkip = false;
+        uint64_t totalBytes = 0;
+        std::wstring formatted;
 
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             auto it = m_cache.find(targetPath);
-            if (it != m_cache.end()) {
-                it->second.sizeBytes = totalBytes;
+            if (it != m_cache.end() && it->second.sizeBytes > 0 && it->second.folderWriteTime != 0 && it->second.folderWriteTime == currentWriteTime) {
+                canSkip = true;
+                totalBytes = it->second.sizeBytes;
+                formatted = it->second.formattedText;
                 it->second.status = CalculationStatus::Ready;
-                it->second.formattedText = std::move(formatted);
-                it->second.folderWriteTime = writeTime;
                 it->second.calculatedTick = GetTickCount64();
+            }
+        }
+
+        if (!canSkip) {
+            totalBytes = ComputeDirectorySize(targetPath);
+            formatted = FormatSize(totalBytes);
+            const uint64_t updatedWriteTime = GetFolderWriteTime(targetPath);
+
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                auto it = m_cache.find(targetPath);
+                if (it != m_cache.end()) {
+                    it->second.sizeBytes = totalBytes;
+                    it->second.status = CalculationStatus::Ready;
+                    it->second.formattedText = formatted;
+                    it->second.folderWriteTime = updatedWriteTime;
+                    it->second.calculatedTick = GetTickCount64();
+                }
             }
         }
 
@@ -184,7 +221,8 @@ uint64_t SizeCalculator::ComputeDirectorySize(const std::wstring& rootPath) cons
             }
 
             const DWORD attrs = findData.dwFileAttributes;
-            if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            // Skip reparse points, offline files, and cloud placeholder recall attributes (OneDrive / Dropbox)
+            if ((attrs & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE | 0x00040000 /*FILE_ATTRIBUTE_RECALL_ON_OPEN*/ | 0x00400000 /*FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS*/)) != 0) {
                 continue;
             }
 
